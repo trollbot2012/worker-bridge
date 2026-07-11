@@ -1,0 +1,31 @@
+{
+  "name": "worker-bridge-vscode",
+  "displayName": "Worker Bridge VS Code",
+  "description": "Loopback HTTP endpoint that lets worker-bridge delegate coding tasks into this VS Code window.",
+  "version": "0.1.0",
+  "publisher": "worker-bridge",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {},
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.93.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -97,11 +97,22 @@ print(result["status"], result["result"]["metadata"]["verification"]["ok"])
 
 ## Workers
 
-Built-in adapters: **codex**, **claude-code**, **opencode**, **mock** (deterministic, for tests). Any other non-interactive coding CLI can be linked:
+Built-in adapters:
+
+- **codex**, **claude-code**, **opencode** — the mainstream coding CLIs.
+- **zcode-glm** — Claude Code pointed at an Anthropic-compatible endpoint (default Z.ai GLM). A template for any alternate endpoint: subclass or construct with a different `base_url`/`model`; the auth token is read from an env var *by name* (`ZCODE_AUTH_TOKEN`) so it never lands in a task spec or result.
+- **vscode** *(experimental)* — delegates into a running VS Code window via the companion `vscode-extension/` (a loopback HTTP bridge on `127.0.0.1:9394`). Install/run the extension first; without it the worker fails closed cleanly. See [`vscode-extension/README.md`](vscode-extension/README.md).
+- **mock** — deterministic, for tests.
+
+Any other non-interactive coding CLI can be linked without code:
 
 ```bash
 worker-bridge workers link my-agent --command-json '["my-agent","run","{prompt}"]'
 ```
+
+### Accepting work
+
+A task's changes live in an isolated worktree and are never merged automatically. When you're satisfied, `worker-bridge tasks accept <task_id>` copies the verified changes back into the source repository (under a repository lock, refusing symlink escapes). Only independently-verified successful tasks can be accepted.
 
 ## Configuration
 

@@ -32,8 +32,8 @@ worker-bridge = "worker_bridge.cli:main"
 worker-bridge-mcp = "worker_bridge.mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/OWNER/worker-bridge"
-Issues = "https://github.com/OWNER/worker-bridge/issues"
+Homepage = "https://github.com/trollbot2012/worker-bridge"
+Issues = "https://github.com/trollbot2012/worker-bridge/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/worker_bridge"]

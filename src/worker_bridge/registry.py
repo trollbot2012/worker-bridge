@@ -12,7 +12,9 @@ from worker_bridge.adapters import (
     GenericCliAdapter,
     MockWorkerAdapter,
     OpenCodeAdapter,
+    VSCodeBridgeAdapter,
     WorkerAdapter,
+    ZCodeGlmAdapter,
 )
 
 
@@ -23,6 +25,8 @@ class WorkerRegistry:
             CodexAdapter(),
             ClaudeCodeAdapter(),
             OpenCodeAdapter(),
+            ZCodeGlmAdapter(),
+            VSCodeBridgeAdapter(),
             DiscoveryOnlyAdapter("gemini-cli", "gemini"),
             MockWorkerAdapter(),
         ):

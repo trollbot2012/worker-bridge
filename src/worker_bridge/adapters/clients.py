@@ -46,6 +46,14 @@ class _StructuredCliWorker(WorkerAdapter):
         self.executable = executable or self.executable_name
         self._processes: dict[str, asyncio.subprocess.Process] = {}
 
+    def _subprocess_env(self) -> dict[str, str]:
+        """Environment for every child process this worker spawns.
+
+        A single overlay seam so subclasses can redirect the CLI (e.g. at an
+        alternate Anthropic-compatible endpoint) without touching the transport.
+        """
+        return hermes_subprocess_env(inherit_credentials=True)
+
     async def detect(self) -> WorkerAvailability:
         executable = shutil.which(self.executable)
         if not executable:
@@ -57,7 +65,7 @@ class _StructuredCliWorker(WorkerAdapter):
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=hermes_subprocess_env(inherit_credentials=True),
+                env=self._subprocess_env(),
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), 10)
         except (OSError, asyncio.TimeoutError) as exc:
@@ -91,7 +99,7 @@ class _StructuredCliWorker(WorkerAdapter):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=hermes_subprocess_env(inherit_credentials=True),
+            env=self._subprocess_env(),
         )
         self._processes[runtime.task_id] = proc
         runtime.emit("worker.process", {"pid": proc.pid, "client": self.name})

@@ -60,7 +60,7 @@ async def worker_delegate(
     Args:
         objective: What the worker must accomplish. Be specific and scoped.
         repository: Absolute path to the target git repository.
-        worker: codex | claude-code | opencode | mock (or a configured worker).
+        worker: codex | claude-code | opencode | zcode-glm | vscode | mock (or a configured worker).
         permission: read_only | workspace_write | full_access | custom.
         verify: Shell commands worker-bridge runs itself to verify, e.g. ["pytest -q"].
         base_ref: Git ref to branch the worktree from (default HEAD).

@@ -241,6 +241,41 @@ class WorkspaceManager:
             ok = ok and record["exit_code"] == 0
         return {"ok": ok, "commands": commands, "changed_files": changed, "forbidden_files": forbidden}
 
+    def integrate(self, runtime: dict[str, Any], repository: str | Path) -> list[str]:
+        """Copy an isolated git worktree's changes into its source repository."""
+        if runtime.get("isolation") == "direct":
+            return []
+        if runtime.get("isolation") != "git_worktree":
+            raise WorkspaceError("only git worktrees can be integrated on acceptance")
+
+        worktree = Path(runtime["path"]).resolve()
+        destination = Path(repository).expanduser().resolve()
+        expected = Path(runtime["repository"]).resolve()
+        if destination != expected:
+            raise WorkspaceError("task repository does not match the prepared workspace")
+
+        proc = _run(
+            ["git", "diff", "--name-only", "--no-renames", "-z", runtime["base_commit"]],
+            worktree,
+            timeout=120,
+        )
+        if proc.returncode:
+            raise WorkspaceError(proc.stderr.strip() or "git diff failed")
+        changed = {name for name in proc.stdout.split("\0") if name}
+        changed.update(name for xy, name in self._status_entries(worktree) if xy == "??")
+
+        for name in sorted(changed):
+            source = worktree / name
+            target = destination / name
+            if source.is_symlink():
+                raise WorkspaceError(f"refusing to integrate symlink: {name}")
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            else:
+                target.unlink(missing_ok=True)
+        return sorted(name.replace("\\", "/") for name in changed)
+
     def apply_diff(self, runtime: dict[str, Any], diff_path: str | Path) -> dict[str, Any]:
         path = Path(runtime["path"])
         patch = Path(diff_path).resolve()

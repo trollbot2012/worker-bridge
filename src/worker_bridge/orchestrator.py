@@ -552,11 +552,17 @@ class WorkerBridge:
 
     def accept_task(self, task_id: str) -> dict[str, Any]:
         task = self.get_task(task_id)
+        spec = TaskSpec.from_dict(task["spec"])
         verification = (task.get("result") or {}).get("metadata", {}).get("verification", {})
         if task["status"] != TaskStatus.SUCCEEDED.value or not verification.get("ok", False):
             raise OrchestrationError("only independently verified successful tasks can be accepted")
+        # Accepting an isolated-worktree task copies its verified changes back
+        # into the source repository, under the repository lock.
+        runtime = task.get("runtime") or {}
+        with RepositoryLock(spec.workspace.repository):
+            changed_files = self.workspaces.integrate(runtime, spec.workspace.repository)
         self.store.update_task(task_id, status=TaskStatus.ACCEPTED.value)
-        self._emit(task_id, "task.accepted", {})
+        self._emit(task_id, "task.accepted", {"changed_files": changed_files})
         return self.get_task(task_id)
 
     def reject_task(self, task_id: str, reason: str) -> dict[str, Any]:

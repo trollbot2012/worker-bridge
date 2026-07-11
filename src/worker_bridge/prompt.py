@@ -3,8 +3,59 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
 from worker_bridge.models import TaskSpec
+
+
+_CONTEXT_LIMIT = 1000
+_MATCH_WORDS = re.compile(r"[a-z0-9][a-z0-9_-]{2,}")
+_STOP_WORDS = {
+    "add", "and", "any", "build", "change", "from", "into", "objective",
+    "the", "this", "with",
+}
+
+
+def _repository_context(objective: str, workspace_path: str) -> str:
+    """Return bounded repository guidance relevant to the worker objective.
+
+    Surfaces the repo's own conventions (AGENTS.md / CLAUDE.md) and any
+    objective-relevant SKILL.md descriptions, so the worker follows local
+    conventions without the orchestrator hand-writing them.
+    """
+    root = Path(workspace_path)
+    entries: list[str] = []
+
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = root / name
+        try:
+            if path.is_file():
+                entries.append(f"Coding conventions ({name}):\n{path.read_text(encoding='utf-8')[:500]}")
+        except (OSError, UnicodeError):
+            continue
+
+    objective_words = set(_MATCH_WORDS.findall(objective.lower())) - _STOP_WORDS
+    try:
+        skill_paths = sorted(root.rglob("SKILL.md"))
+    except OSError:
+        skill_paths = []
+    for path in skill_paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        match = re.search(r"^description:\s*[\"']?(.+?)[\"']?\s*$", text, re.MULTILINE | re.IGNORECASE)
+        if not match:
+            continue
+        description = match.group(1)
+        skill_words = set(_MATCH_WORDS.findall(f"{path.parent.name} {description}".lower())) - _STOP_WORDS
+        if objective_words & skill_words:
+            entries.append(f"Matching skill ({path.parent.name}): {description}")
+
+    if not entries:
+        return ""
+    return ("CONTEXT:\n" + "\n\n".join(entries))[:_CONTEXT_LIMIT]
 
 
 _ROLE_INSTRUCTIONS = {
@@ -21,6 +72,8 @@ _ROLE_INSTRUCTIONS = {
 
 
 def build_worker_prompt(task: TaskSpec, workspace_path: str) -> str:
+    repository_context = _repository_context(task.objective, workspace_path)
+    objective = f"{repository_context}\n\n{task.objective}" if repository_context else task.objective
     context = json.dumps(task.context, indent=2, sort_keys=True)
     permissions = json.dumps(task.permissions.__dict__ if hasattr(task.permissions, "__dict__") else {
         name: getattr(task.permissions, name)
@@ -35,7 +88,7 @@ def build_worker_prompt(task: TaskSpec, workspace_path: str) -> str:
 The orchestrator owns task state, permissions, acceptance, integration, and user communication. {role_text}
 
 Objective:
-{task.objective}
+{objective}
 
 Assigned workspace (operate only here):
 {workspace_path}
