@@ -1,0 +1,123 @@
+# worker-bridge
+
+**Delegate coding tasks to external AI coding agents — in isolated git worktrees, with independent verification — from any agent, over MCP.**
+
+worker-bridge lets one AI agent hand a scoped coding job (implement a feature, fix a cross-file bug, run a migration) to an external coding CLI — **Codex, Claude Code, OpenCode, or any command-line agent** — inside an isolated git worktree, then **independently verifies the diff itself** before handing it back. It exposes this as an **MCP server**, so any MCP-capable client (Claude Code, Cursor, Windsurf, Cline, Continue, …) can use it with zero code.
+
+Dispatching agents is commodity. worker-bridge is about dispatching with a **provable chain of custody**: isolated execution, host-wide concurrency limits, an independent verification gate, and secret-safe event logs.
+
+## Why
+
+- **Isolation by default** — each task runs in its own `git worktree` on a fresh branch. Workers never touch your working tree.
+- **Independent verification** — the orchestrator runs your verification commands (`pytest -q`, `npm test`, …) itself, separately from the worker, and records the result. A worker can't mark its own homework.
+- **Cross-process safety** — task ownership is an atomic SQLite claim and concurrency is enforced by DB-backed leases, so many independently-launched runners can share one host without double-executing a task or overrunning limits.
+- **Windows-aware** — cancellation kills the whole worker process tree (validated by command line, so a recycled PID is never killed).
+- **Secret-safe** — connection strings, PEM keys, and cloud key IDs are redacted before anything is persisted.
+- **Multi-worker** — run the same task on several workers and compare, or run an implementer + a reviewer.
+
+> These guarantees come from an independent production audit of the engine; see [`docs/audit.md`](docs/audit.md) for the findings.
+
+## Install
+
+```bash
+pip install worker-bridge-mcp
+```
+
+You also need at least one worker CLI on your `PATH` — e.g. [Codex](https://github.com/openai/codex), [Claude Code](https://docs.claude.com/claude-code), or [OpenCode](https://opencode.ai). Run `worker-bridge workers list` to see what's detected.
+
+## Use it as an MCP server
+
+The server runs over stdio. Add it to your MCP client:
+
+**Claude Code**
+```bash
+claude mcp add worker-bridge -- worker-bridge-mcp
+```
+
+**Cursor / Windsurf / Cline / Continue** — add to the client's MCP config (`mcp.json` / settings):
+```json
+{
+  "mcpServers": {
+    "worker-bridge": {
+      "command": "worker-bridge-mcp"
+    }
+  }
+}
+```
+
+Optional environment:
+```json
+{
+  "mcpServers": {
+    "worker-bridge": {
+      "command": "worker-bridge-mcp",
+      "env": { "WORKER_BRIDGE_HOME": "/path/to/state", "WORKER_BRIDGE_MAX_CONCURRENCY": "4" }
+    }
+  }
+}
+```
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `worker_delegate` | Start a scoped coding task on a worker in an isolated worktree; returns a `task_id`. |
+| `worker_status` | Poll a task: status, summary, changed files, verification result, artifact paths. |
+| `list_workers` | Which coding workers are installed and healthy on this machine. |
+| `worker_cancel` | Cancel a task and terminate its worker process tree. |
+| `worker_logs` | Normalized event stream for a task (progress, completion, verification). |
+
+Typical flow, from the host agent's side: call `worker_delegate(objective=…, repository=…, verify=["pytest -q"])`, then poll `worker_status(task_id)` until it's `succeeded`/`failed`. The changed files land in an isolated worktree plus a diff artifact; nothing is merged into your branch automatically.
+
+## Use it as a CLI
+
+```bash
+worker-bridge workers list
+worker-bridge tasks create --objective "Add a --json flag" --repo /abs/path/repo --worker codex --verify "pytest -q"
+worker-bridge tasks start <task_id> --wait
+worker-bridge tasks show <task_id>
+```
+
+## Use it as a Python library
+
+```python
+import asyncio
+from worker_bridge import WorkerBridge
+
+bridge = WorkerBridge()
+task = bridge.create_task({
+    "objective": "Add a --json flag to the CLI",
+    "worker": "codex",
+    "workspace": {"repository": "/abs/path/to/repo", "isolation": "git_worktree"},
+    "verification": {"commands": ["pytest -q"]},
+})
+result = asyncio.run(bridge.start_task(task["task_id"]))
+print(result["status"], result["result"]["metadata"]["verification"]["ok"])
+```
+
+## Workers
+
+Built-in adapters: **codex**, **claude-code**, **opencode**, **mock** (deterministic, for tests). Any other non-interactive coding CLI can be linked:
+
+```bash
+worker-bridge workers link my-agent --command-json '["my-agent","run","{prompt}"]'
+```
+
+## Configuration
+
+State lives under `WORKER_BRIDGE_HOME` (default `~/.worker-bridge/`): the SQLite store, worktrees, and artifacts. Tunables via env or `~/.worker-bridge/config.yaml`:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `WORKER_BRIDGE_HOME` | `~/.worker-bridge` | State root |
+| `WORKER_BRIDGE_MAX_CONCURRENCY` | `4` | Global concurrent workers (host-wide) |
+| `WORKER_BRIDGE_REPO_CONCURRENCY` | `3` | Concurrent workers per repository |
+| `WORKER_BRIDGE_STORE` | — | Override the SQLite path |
+
+## Security
+
+Custom/read-only permission profiles are checked after execution and are **not** an OS sandbox — the real filesystem boundary is the worker client's own sandbox (Codex `workspace-write`, etc.), which the bridge selects per profile. Symlink escapes are detected and fail the task; a raw path-traversal write by a sandbox-less worker cannot be seen post-hoc. Do not point a `full_access` worker at hostile input without a container. Secrets are redacted from the event log and store.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
