@@ -76,7 +76,7 @@ def _bridge(store: WorkerStore, adapter: MockWorkerAdapter, root: Path, **kwargs
     )
 
 
-# ── P0-1: recovery never clobbers a live task ────────────────────────────────
+# --- P0-1: recovery never clobbers a live task ---
 
 def test_recover_running_leaves_live_pid_untouched(tmp_path: Path, repository: Path):
     store = WorkerStore(tmp_path / "s.db")
@@ -106,7 +106,7 @@ def test_constructing_a_second_bridge_does_not_pause_live_task(tmp_path: Path, r
     assert store.get_task("t")["status"] == "running"
 
 
-# ── P0-2: atomic claim + terminal guard ──────────────────────────────────────
+# --- P0-2: atomic claim + terminal guard ---
 
 def test_two_bridges_cannot_both_run_one_task(tmp_path: Path, repository: Path):
     store = WorkerStore(tmp_path / "s.db")
@@ -139,7 +139,7 @@ def test_terminal_task_is_not_reexecuted(tmp_path: Path, repository: Path):
     assert adapter.starts == 1
 
 
-# ── P0-3: cross-process scheduler caps hold host-wide ────────────────────────
+# --- P0-3: cross-process scheduler caps hold host-wide ---
 
 def test_global_cap_holds_across_two_bridges(tmp_path: Path, repository: Path):
     store = WorkerStore(tmp_path / "s.db")
@@ -159,7 +159,7 @@ def test_global_cap_holds_across_two_bridges(tmp_path: Path, repository: Path):
     assert adapter.max_observed == 1
 
 
-# ── P0-5: verification-gate filename integrity ───────────────────────────────
+# --- P0-5: verification-gate filename integrity ---
 
 def test_forbidden_path_not_bypassed_by_leading_status_space(tmp_path: Path, repository: Path):
     wm = WorkspaceManager(tmp_path / "wt")
@@ -176,15 +176,18 @@ def test_changed_files_handles_spaces_and_unicode(tmp_path: Path, repository: Pa
     wm = WorkspaceManager(tmp_path / "wt")
     runtime = wm.prepare("u", {"workspace": {"repository": str(repository), "isolation": "git_worktree", "base_ref": "HEAD"}})
     root = Path(runtime["path"])
+    # Unicode via escape so the assertion never depends on how this test file's
+    # own source bytes are decoded on a given platform/CI runner.
+    unicode_name = "na" + chr(0xEF) + "ve.txt"  # U+00EF, ASCII source so CI encoding never matters
     (root / "my file.txt").write_text("x", encoding="utf-8")
-    (root / "naïve.txt").write_text("y", encoding="utf-8")
+    (root / unicode_name).write_text("y", encoding="utf-8")
     changed = wm.changed_files(runtime)
     assert "my file.txt" in changed
-    assert "naïve.txt" in changed
+    assert unicode_name in changed
     assert not any(name.startswith('"') for name in changed)
 
 
-# ── P1-6: redaction ──────────────────────────────────────────────────────────
+# --- P1-6: redaction ---
 
 @pytest.mark.parametrize(
     "secret",
@@ -213,7 +216,7 @@ def test_redaction_persists_nothing_secret_in_store(tmp_path: Path):
     assert "AKIAIOSFODNN7EXAMPLE" not in blob
 
 
-# ── P1-7: symlink escape detection ───────────────────────────────────────────
+# --- P1-7: symlink escape detection ---
 
 def test_symlink_escape_is_flagged(tmp_path: Path, repository: Path):
     wm = WorkspaceManager(tmp_path / "wt")
@@ -230,7 +233,7 @@ def test_symlink_escape_is_flagged(tmp_path: Path, repository: Path):
     assert "link" in escapes
 
 
-# ── P1-8: integration round-trip on a tracked-file edit ──────────────────────
+# --- P1-8: integration round-trip on a tracked-file edit ---
 
 def test_integration_applies_tracked_file_edit(tmp_path: Path, repository: Path):
     wm = WorkspaceManager(tmp_path / "wt")
@@ -245,7 +248,7 @@ def test_integration_applies_tracked_file_edit(tmp_path: Path, repository: Path)
     assert (Path(dst["path"]) / "README.md").read_text().strip() == "changed"
 
 
-# ── P0-4: process-tree cancellation + PID-owner validation ───────────────────
+# --- P0-4: process-tree cancellation + PID-owner validation ---
 
 def _alive(pid: int) -> bool:
     try:
