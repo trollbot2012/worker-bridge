@@ -25,10 +25,14 @@ _PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 def _run(args: list[str], cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    # Decode git output as UTF-8 explicitly. `text=True` alone uses the locale
+    # encoding, which on a non-UTF-8 Windows console (cp1252) mangles non-ASCII
+    # filenames git emits as UTF-8 bytes — corrupting changed_files/diff/verify.
     return subprocess.run(
         args,
         cwd=cwd,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=timeout,
         stdin=subprocess.DEVNULL,
