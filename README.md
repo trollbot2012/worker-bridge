@@ -125,6 +125,15 @@ State lives under `WORKER_BRIDGE_HOME` (default `~/.worker-bridge/`): the SQLite
 | `WORKER_BRIDGE_REPO_CONCURRENCY` | `3` | Concurrent workers per repository |
 | `WORKER_BRIDGE_STORE` | — | Override the SQLite path |
 
+## Storage safety
+
+Workspace allocation is designed so a delegation can never quietly eat the disk:
+
+- **Containment** — the worker root and the target repository must never contain each other (checked by path math, not names), so a task can never recursively copy earlier tasks' workspaces into itself. Copying a repo at or above the bridge home requires an explicit `allow_profile_copy` opt-in, and copy sources containing symlinks/junctions are refused outright.
+- **Copy budgets + disk reserve** — `copy` isolation measures the source first (honoring cache/VCS exclusions like `.git`, `node_modules`, `__pycache__`) and refuses anything over 2 GiB / 50k files; the copy must also leave at least max(10 GiB, 5% of capacity) free on disk.
+- **Two-phase allocation** — the destination is planned and persisted (`allocation_state: "allocating"`) *before* any filesystem mutation, and the mutation runs under a timeout. A crash, kill, or hang always leaves a task record naming the directory it was building, a clean `failed`/`timed_out` state, and a swept partial tree — never an unfindable half-copied giant.
+- **Prune** — `worker-bridge workspaces prune` (dry-run by default; `--apply` to delete, `--include-paused` to widen) and the `worker_prune` MCP tool reclaim worktrees of terminal tasks plus orphan directories no task record references. Accepted tasks reclaim their worktree automatically.
+
 ## Security
 
 Custom/read-only permission profiles are checked after execution and are **not** an OS sandbox — the real filesystem boundary is the worker client's own sandbox (Codex `workspace-write`, etc.), which the bridge selects per profile. Symlink escapes are detected and fail the task; a raw path-traversal write by a sandbox-less worker cannot be seen post-hoc. Do not point a `full_access` worker at hostile input without a container. Secrets are redacted from the event log and store.

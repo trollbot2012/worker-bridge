@@ -274,7 +274,55 @@ class WorkerBridge:
                 return current
             runtime = dict(self.get_task(task_id).get("runtime") or {})
             if not runtime.get("path"):
-                runtime = self.workspaces.prepare(task_id, spec.to_dict())
+                # Two-phase allocation. plan() validates and NAMES the
+                # destination with no filesystem mutation; we persist that
+                # record (allocation_state='allocating') BEFORE allocate()
+                # copies anything, so a crash/kill mid-copy always leaves a
+                # task that points at the directory it was building —
+                # otherwise an interrupted giant copy is unfindable because
+                # nothing is recorded until copytree finishes. allocate() runs
+                # in a thread under the task timeout so a slow/hung build
+                # becomes a clean terminal state, and any partial tree is
+                # swept.
+                prep_timeout = min(spec.limits.timeout_seconds, 600)
+                try:
+                    plan = self.workspaces.plan(task_id, spec.to_dict())
+                    if plan.get("allocation_state") == "allocating":
+                        self.store.update_task(task_id, runtime={**plan, "pid": pid})
+                    runtime = await asyncio.wait_for(
+                        asyncio.to_thread(self.workspaces.allocate, plan),
+                        timeout=prep_timeout,
+                    )
+                except Exception as exc:  # noqa: BLE001 — includes asyncio.TimeoutError
+                    try:
+                        self.workspaces.cleanup_partial(locals().get("plan") or {})
+                    except Exception:
+                        pass
+                    timed_out = isinstance(exc, asyncio.TimeoutError)
+                    status = (
+                        TaskStatus.TIMED_OUT.value if timed_out else TaskStatus.FAILED.value
+                    )
+                    err = (
+                        "workspace preparation timed out"
+                        if timed_out
+                        else f"workspace preparation failed: {type(exc).__name__}: {exc}"
+                    )
+                    runtime["completed_at"] = time.time()
+                    runtime.pop("pid", None)
+                    self.store.update_task(
+                        task_id,
+                        status=status,
+                        runtime=runtime,
+                        result=asdict(WorkerResult(status, error=err)),
+                    )
+                    self._emit(
+                        task_id,
+                        "worker.completed",
+                        {"status": status, "session_id": None, "error": err},
+                    )
+                    self._record_failure(spec.worker)
+                    self._update_parent_job(task.get("job_id"))
+                    return self.get_task(task_id)
             runtime["pid"] = pid
             runtime["started_at"] = time.time()
             self.store.update_task(task_id, runtime=runtime)
@@ -563,7 +611,72 @@ class WorkerBridge:
             changed_files = self.workspaces.integrate(runtime, spec.workspace.repository)
         self.store.update_task(task_id, status=TaskStatus.ACCEPTED.value)
         self._emit(task_id, "task.accepted", {"changed_files": changed_files})
+        # An accepted result has been integrated/consumed; its isolated
+        # worktree is dead weight. Reclaim it (never a direct workspace).
+        if runtime.get("path") and runtime.get("isolation") != "direct":
+            try:
+                self.workspaces.cleanup(runtime)
+                runtime = dict(runtime)
+                runtime["retained"] = False
+                self.store.update_task(task_id, runtime=runtime)
+            except Exception:  # noqa: BLE001 — a hook may reject branch deletion
+                pass
         return self.get_task(task_id)
+
+    def prune_workspaces(self, *, apply: bool = False, include_paused: bool = False) -> dict[str, Any]:
+        """Reclaim isolated worktrees that no longer back active work.
+
+        Dry-run by default. Never touches running/queued/verifying/created
+        tasks, direct workspaces, or (unless include_paused) paused tasks.
+        Also finds orphan directories under the worker root that no task
+        record references — the residue an interrupted allocation leaves
+        behind.
+        """
+        active = {
+            TaskStatus.RUNNING.value, TaskStatus.QUEUED.value,
+            TaskStatus.VERIFYING.value, TaskStatus.CREATED.value,
+        }
+        removable: list[dict[str, Any]] = []
+        known_paths: set[str] = set()
+        for task in self.store.list_tasks(limit=100000):
+            runtime = task.get("runtime") or {}
+            path = runtime.get("path")
+            if path:
+                known_paths.add(path)
+            if not path or runtime.get("isolation") == "direct" or runtime.get("retained") is False:
+                continue
+            status = task["status"]
+            prunable = status in TERMINAL_TASK_STATUSES or (
+                include_paused and status == TaskStatus.PAUSED.value
+            )
+            if status in active or not prunable:
+                continue
+            removable.append({"task_id": task["task_id"], "status": status, "path": path, "runtime": runtime})
+        orphans = self.workspaces.discover_orphans(known_paths)
+
+        pruned, failed = [], []
+        if apply:
+            for item in removable:
+                try:
+                    self.workspaces.cleanup(item["runtime"])
+                    r = dict(item["runtime"])
+                    r["retained"] = False
+                    self.store.update_task(item["task_id"], runtime=r)
+                    pruned.append(item["task_id"])
+                except Exception as exc:  # noqa: BLE001
+                    failed.append({"task_id": item["task_id"], "error": str(exc)})
+            for path in orphans:
+                try:
+                    self.workspaces.cleanup_orphan(path)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append({"path": path, "error": str(exc)})
+        return {
+            "applied": apply,
+            "candidates": removable,
+            "orphans": orphans,
+            "pruned": pruned,
+            "failed": failed,
+        }
 
     def reject_task(self, task_id: str, reason: str) -> dict[str, Any]:
         task = self.get_task(task_id)

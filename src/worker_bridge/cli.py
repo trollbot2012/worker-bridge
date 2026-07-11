@@ -135,6 +135,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
 
     health = subs.add_parser("health", help="Show bridge and worker health")
     _add_store(health)
+
+    workspaces = subs.add_parser("workspaces", help="Inspect and reclaim worker worktrees")
+    ws_sub = workspaces.add_subparsers(dest="worker_action")
+    prune = ws_sub.add_parser("prune", help="Reclaim worktrees no active task backs (dry-run by default)")
+    prune.add_argument("--apply", action="store_true", help="actually delete (default: dry-run report)")
+    prune.add_argument("--include-paused", action="store_true", help="also reclaim paused-task worktrees")
+    _add_store(prune)
+
     parser.set_defaults(func=worker_command)
 
 
@@ -248,7 +256,7 @@ def worker_command(args: argparse.Namespace) -> int:
     area = getattr(args, "worker_area", None)
     action = getattr(args, "worker_action", None)
     if not area:
-        print("Usage: worker-bridge {workers|tasks|jobs|requests|results|health} ...")
+        print("Usage: worker-bridge {workers|tasks|jobs|requests|results|workspaces|health} ...")
         return 2
     bridge = _bridge(args)
     try:
@@ -275,6 +283,8 @@ def worker_command(args: argparse.Namespace) -> int:
             _json(items)
         elif area == "health":
             _json({"store": str(bridge.store.path), "workers": asyncio.run(bridge.registry.list())})
+        elif area == "workspaces" and action == "prune":
+            _json(bridge.prune_workspaces(apply=args.apply, include_paused=args.include_paused))
         elif area == "tasks":
             return _task_command(bridge, args, action)
         elif area == "jobs":

@@ -171,6 +171,33 @@ async def worker_logs(task_id: str, after: int = 0) -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+@mcp.tool()
+async def worker_prune(apply: bool = False, include_paused: bool = False) -> dict:
+    """Reclaim disk from isolated worktrees that no longer back active work.
+
+    Dry-run by default: reports which terminal-task worktrees and orphan
+    directories (left by interrupted allocations) would be removed. Pass
+    apply=true to actually delete them. Never touches running/queued/verifying
+    tasks or direct (in-place) workspaces; include_paused=true also reclaims
+    paused-task worktrees.
+    """
+    try:
+        bridge = _make_bridge()
+        report = bridge.prune_workspaces(apply=apply, include_paused=include_paused)
+        return {
+            "applied": report["applied"],
+            "candidates": [
+                {"task_id": c["task_id"], "status": c["status"], "path": c["path"]}
+                for c in report["candidates"]
+            ],
+            "orphans": report["orphans"],
+            "pruned": report["pruned"],
+            "failed": report["failed"],
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def main() -> None:
     mcp.run()
 
