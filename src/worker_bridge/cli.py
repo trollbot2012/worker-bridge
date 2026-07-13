@@ -15,6 +15,7 @@ from worker_bridge.environ import get_home as get_hermes_home
 from worker_bridge.orchestrator import WorkerBridge
 from worker_bridge.registry import WorkerRegistry
 from worker_bridge.store import WorkerStore
+from worker_bridge.workflows import TASK_TYPES, apply_task_type
 from worker_bridge.workspace import WorkspaceManager
 
 
@@ -63,7 +64,13 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     create.add_argument("--spec", help="JSON task contract")
     create.add_argument("--objective")
     create.add_argument("--repo")
-    create.add_argument("--worker", default="codex")
+    # Workflow-typed dispatch: the type shapes priority, budgets, auto-repair
+    # and (when the caller names no worker) the worker tier. Explicit flags
+    # always win over the type profile.
+    create.add_argument("--type", choices=list(TASK_TYPES), dest="task_type",
+                        help="workflow type; fills priority/limits/worker defaults")
+    create.add_argument("--worker", default=None, help="worker name (default: type profile, then codex)")
+    create.add_argument("--priority", type=int, default=None)
     create.add_argument("--role", default="implementer")
     create.add_argument("--base-ref", default="HEAD")
     create.add_argument("--isolation", choices=["git_worktree", "direct", "copy"], default="git_worktree")
@@ -74,7 +81,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     create.add_argument("--forbid", action="append", default=[])
     create.add_argument("--idempotency-key")
     create.add_argument("--job-id")
-    create.add_argument("--timeout", type=int, default=3600)
+    create.add_argument("--timeout", type=int, default=None)
     _add_store(create)
     for action in ("list", "show", "logs", "artifacts", "start", "attach", "continue", "submit-input", "redirect", "cancel", "pause", "resume", "retry", "verify", "accept", "reject", "handoff"):
         p = task_sub.add_parser(action)
@@ -188,31 +195,46 @@ def _bridge(args: argparse.Namespace) -> WorkerBridge:
             "retain_cancelled_tasks": bool(section.get("retain_cancelled_tasks", True)),
             "retain_unaccepted_tasks": bool(section.get("retain_unaccepted_tasks", True)),
         },
+        verification_auto_repair=int(section.get("verification_auto_repair", 1)),
     )
 
 
-def _load_task_spec(args: argparse.Namespace) -> dict[str, Any]:
+def _load_task_spec(
+    args: argparse.Namespace, available_workers: list[str] | None = None
+) -> dict[str, Any]:
     if args.spec:
-        return json.loads(Path(args.spec).read_text(encoding="utf-8"))
-    if not args.objective or not args.repo:
-        raise ValueError("--objective and --repo are required without --spec")
-    return {
-        "objective": args.objective,
-        "worker": args.worker,
-        "role": args.role,
-        "job_id": args.job_id,
-        "idempotency_key": args.idempotency_key,
-        "workspace": {
-            "repository": str(Path(args.repo).expanduser().resolve()),
-            "isolation": args.isolation,
-            "base_ref": args.base_ref,
-        },
-        "permissions": {"profile": args.permission},
-        "constraints": args.constraint,
-        "acceptance_criteria": args.acceptance,
-        "verification": {"commands": args.verify, "forbidden_paths": args.forbid},
-        "limits": {"timeout_seconds": args.timeout},
-    }
+        payload = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    else:
+        if not args.objective or not args.repo:
+            raise ValueError("--objective and --repo are required without --spec")
+        payload = {
+            "objective": args.objective,
+            "role": args.role,
+            "job_id": args.job_id,
+            "idempotency_key": args.idempotency_key,
+            "workspace": {
+                "repository": str(Path(args.repo).expanduser().resolve()),
+                "isolation": args.isolation,
+                "base_ref": args.base_ref,
+            },
+            "permissions": {"profile": args.permission},
+            "constraints": args.constraint,
+            "acceptance_criteria": args.acceptance,
+            "verification": {"commands": args.verify, "forbidden_paths": args.forbid},
+        }
+        # Absent-when-defaulted keys let a --type profile fill them; the
+        # TaskSpec dataclass supplies the final fallbacks (worker=codex,
+        # timeout=3600, priority=50).
+        if args.worker:
+            payload["worker"] = args.worker
+        if args.priority is not None:
+            payload["priority"] = args.priority
+        if args.timeout is not None:
+            payload["limits"] = {"timeout_seconds": args.timeout}
+    task_type = getattr(args, "task_type", None)
+    if task_type:
+        apply_task_type(payload, task_type, available_workers=available_workers)
+    return payload
 
 
 def _spawn(bridge: WorkerBridge, task_id: str, message: str | None = None) -> dict[str, Any]:
@@ -389,7 +411,7 @@ def _unlink_worker(worker: str) -> dict[str, Any]:
 
 def _task_command(bridge: WorkerBridge, args: argparse.Namespace, action: str | None) -> int:
     if action == "create":
-        _json(bridge.create_task(_load_task_spec(args)))
+        _json(bridge.create_task(_load_task_spec(args, available_workers=bridge.registry.names())))
     elif action == "list":
         _json(bridge.list_tasks(status=args.status))
     elif action == "show":

@@ -78,6 +78,27 @@ worker-bridge tasks start <task_id> --wait
 worker-bridge tasks show <task_id>
 ```
 
+### Workflow-typed dispatch
+
+`tasks create --type {chore,feature,hotfix,refactor}` shapes the task at
+creation time. The profile fills only fields you left unset — explicit
+`--worker`/`--priority`/`--timeout` (or keys in a `--spec` contract) always
+win. `chore` → priority 30, 900s budget, cheapest adequate worker; `hotfix` →
+priority 90 with a tight 1800s budget. The type lands in `spec.metadata.type`
+for downstream tooling. Profiles live in `worker_bridge/workflows.py`.
+
+### Verification auto-repair
+
+When independent verification fails, the failing commands' exit codes and
+output tails are piped back into the worker's native session as a follow-up,
+and the follow-up run re-verifies — bounded by `verification_auto_repair` in
+config (default 1 attempt), per-task `metadata.auto_repair` (0 disables), and
+`limits.maximum_follow_up_turns`. Repair attempts emit
+`verification.auto_repair` events; only an unrepairable failure counts toward
+the worker's circuit breaker. Deterministic checks stay outside the agent
+loop — tokens are spent only when a check fails and its output carries
+information the worker needs.
+
 ## Use it as a Python library
 
 ```python

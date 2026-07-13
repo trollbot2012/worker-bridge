@@ -37,6 +37,9 @@ class WorkerRegistry:
             raise ValueError("adapter name is required")
         self._adapters[adapter.name] = adapter
 
+    def names(self) -> list[str]:
+        return sorted(self._adapters)
+
     def get(self, name: str) -> WorkerAdapter:
         try:
             return self._adapters[name]

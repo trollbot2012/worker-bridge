@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import shutil
+from pathlib import Path
 
 from worker_bridge.environ import subprocess_env as hermes_subprocess_env
 
@@ -70,10 +72,35 @@ class GenericCliAdapter(WorkerAdapter):
         return WorkerResult(
             "succeeded" if proc.returncode == 0 else "failed",
             summary=output,
-            session_id=execution_id,
+            session_id=self._extract_session_id(output) or execution_id,
             error=error or None if proc.returncode else None,
             metadata={"exit_code": proc.returncode, "command": shlex.join(args)},
         )
+
+    @staticmethod
+    def _extract_session_id(output: str) -> str | None:
+        """Best-effort native session id from a structured CLI's stdout.
+
+        Config workers built on ``claude -p --output-format json`` emit their
+        session id in the JSON payload. Without this, the fallback session id
+        is the child PID, which the resume_command's ``--resume {session_id}``
+        can never resolve — so follow-ups and verification auto-repair
+        silently could not work for any config-defined worker."""
+        text = output.strip()
+        if not text.startswith(("{", "[")):
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        candidates = payload if isinstance(payload, list) else [payload]
+        for item in candidates:
+            if isinstance(item, dict):
+                for key in ("session_id", "sessionId", "sessionID"):
+                    value = item.get(key)
+                    if value:
+                        return str(value)
+        return None
 
     async def start(self, task: TaskSpec, runtime: RuntimeContext) -> WorkerResult:
         return await self._run(self.command, task.objective, runtime)
@@ -84,7 +111,22 @@ class GenericCliAdapter(WorkerAdapter):
         if not self.resume_command:
             raise NotImplementedError(f"{self.name} has no resume command")
         argv = [part.replace("{session_id}", session_id) for part in self.resume_command]
-        return await self._run(argv, message, runtime)
+        # Follow-up messages (e.g. a verification auto-repair transcript) are
+        # multi-line; passed inline through ``{prompt}`` argv they get mangled
+        # by Windows .CMD-shim parsing. Write the message to a brief file in
+        # the workspace and hand the CLI a one-line pointer instead.
+        brief = Path(runtime.workspace) / f".worker-bridge-followup-{runtime.task_id}.md"
+        brief.write_text(
+            "Follow-up for the existing task:\n\n" + message, encoding="utf-8"
+        )
+        pointer = (
+            f"Read the file {brief.name} in your current directory and carry out "
+            "its follow-up now. Do not just describe the work."
+        )
+        try:
+            return await self._run(argv, pointer, runtime)
+        finally:
+            brief.unlink(missing_ok=True)
 
     async def cancel(self, execution_id: str) -> None:
         process = self._processes.get(execution_id)

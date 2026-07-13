@@ -76,6 +76,7 @@ class WorkerBridge:
         per_repository_concurrency: int = 3,
         per_job_concurrency: int = 3,
         retention: dict[str, bool] | None = None,
+        verification_auto_repair: int = 1,
     ) -> None:
         self.store = store or WorkerStore()
         self.registry = registry or WorkerRegistry()
@@ -93,6 +94,11 @@ class WorkerBridge:
             "retain_unaccepted_tasks": True,
             **(retention or {}),
         }
+        # Automatic verification repair: when independent verification fails,
+        # pipe the failing commands' output back into the worker's native
+        # session this many times before the failure becomes terminal. Per-task
+        # override via spec.metadata["auto_repair"]; 0 disables.
+        self._verification_auto_repair = max(0, int(verification_auto_repair))
         self._failures: dict[str, list[float]] = {}
         self.store.recover_running()
 
@@ -196,6 +202,52 @@ class WorkerBridge:
 
     def _record_failure(self, worker: str) -> None:
         self._failures.setdefault(worker, []).append(time.time())
+
+    def _auto_repair_budget(self, spec: TaskSpec) -> int:
+        """Allowed automatic verification-repair attempts for this task."""
+        override = (spec.metadata or {}).get("auto_repair")
+        if override is None:
+            return self._verification_auto_repair
+        try:
+            return max(0, int(override))
+        except (TypeError, ValueError):
+            return self._verification_auto_repair
+
+    @staticmethod
+    def _format_verification_repair(verification: dict[str, Any]) -> str:
+        """Turn a failed verification record into a worker follow-up message.
+
+        Only failing commands are included, output tails capped so the message
+        stays well inside one prompt even when a test runner dumps thousands
+        of lines.
+        """
+        lines = [
+            "Independent verification failed after your changes. Fix the code in "
+            "this workspace so every check below passes, then stop.",
+        ]
+        for record in verification.get("commands", []):
+            if record.get("exit_code") == 0:
+                continue
+            exit_code = record.get("exit_code")
+            lines.append(f"\n$ {record.get('command')}")
+            lines.append(f"exit code: {'timed out' if exit_code is None else exit_code}")
+            stderr_tail = str(record.get("stderr") or "").strip()[-1500:]
+            stdout_tail = str(record.get("stdout") or "").strip()[-1500:]
+            if stderr_tail:
+                lines.append(f"stderr (tail):\n{stderr_tail}")
+            if stdout_tail:
+                lines.append(f"stdout (tail):\n{stdout_tail}")
+        forbidden = verification.get("forbidden_files") or []
+        if forbidden:
+            lines.append(
+                "\nThese files are forbidden for this task and must not appear in "
+                "your diff — revert every change to them: " + ", ".join(map(str, forbidden))
+            )
+        lines.append(
+            "\nDo not report success unless the checks actually pass; the bridge "
+            "re-runs them independently after your turn."
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _extract_permission_request(summary: str) -> dict[str, Any] | None:
@@ -443,7 +495,33 @@ class WorkerBridge:
             )
             if not verification["ok"] and not result.error:
                 result.error = "independent verification failed"
-        if result.status == TaskStatus.FAILED.value:
+
+        # Verification auto-repair (the deterministic-check → agent feedback
+        # pipe): a verification failure is not terminal while repair budget
+        # remains AND the worker left a resumable native session. The failing
+        # commands' output goes back into that session as a follow-up; the
+        # follow-up run re-verifies through this same code path, so repair is
+        # naturally bounded by the budget plus maximum_follow_up_turns.
+        repair_message: str | None = None
+        verification_outcome = result.metadata.get("verification")
+        if (
+            result.status == TaskStatus.FAILED.value
+            and isinstance(verification_outcome, dict)
+            and verification_outcome.get("ok") is False
+            and result.session_id
+        ):
+            repair_budget = self._auto_repair_budget(spec)
+            repair_attempts = int(runtime.get("auto_repair_attempts") or 0)
+            if repair_attempts < repair_budget:
+                capabilities = await adapter.capabilities()
+                if capabilities.sessions:
+                    repair_message = self._format_verification_repair(verification_outcome)
+                    runtime["auto_repair_attempts"] = repair_attempts + 1
+
+        # Only a failure we will NOT repair counts toward the worker's circuit
+        # breaker — otherwise one repairable task could open the circuit and
+        # block its own repair attempt.
+        if result.status == TaskStatus.FAILED.value and repair_message is None:
             self._record_failure(spec.worker)
         runtime["completed_at"] = time.time()
         runtime.pop("pid", None)
@@ -454,6 +532,23 @@ class WorkerBridge:
             {"status": result.status, "session_id": result.session_id, "error": result.error},
         )
         self._update_parent_job(task.get("job_id"))
+        if repair_message is not None:
+            self._emit(
+                task_id,
+                "verification.auto_repair",
+                {
+                    "attempt": runtime["auto_repair_attempts"],
+                    "budget": self._auto_repair_budget(spec),
+                },
+            )
+            try:
+                return await self.continue_task(task_id, repair_message)
+            except OrchestrationError as exc:
+                # Follow-up turns exhausted or session unresumable: fall back
+                # to the terminal failure the repair would have superseded.
+                self._emit(task_id, "verification.auto_repair_abandoned", {"error": str(exc)})
+                self._record_failure(spec.worker)
+                return self.get_task(task_id)
         if result.status in {TaskStatus.FAILED.value, TaskStatus.TIMED_OUT.value} and not self._retention["retain_failed_tasks"]:
             self.workspaces.cleanup(runtime)
             runtime["retained"] = False
