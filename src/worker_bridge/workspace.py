@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -169,25 +170,46 @@ def _reftx_hook_present(repository: Path) -> bool:
 
 
 class RepositoryLock:
-    """Process and cross-process lock used by direct-workspace mode."""
+    """Process and cross-process lock used by direct-workspace mode.
 
-    def __init__(self, repository: str | Path) -> None:
+    ``operation`` scopes the lock to one kind of work: concurrent operations
+    of *different* kinds on the same repository (e.g. a short worktree-setup
+    vs. a direct-mode worker holding the plain lock for its whole run) must
+    not serialize on one global per-repo lock. Same operation on the same
+    repository still excludes.
+
+    ``wait_seconds`` bounds how long acquisition waits for a live holder to
+    release before raising. The default (0) keeps the historical fail-fast
+    behavior direct mode relies on.
+    """
+
+    def __init__(
+        self,
+        repository: str | Path,
+        *,
+        operation: str | None = None,
+        wait_seconds: float = 0.0,
+    ) -> None:
         resolved = str(Path(repository).resolve())
+        key = f"{resolved}::{operation}" if operation else resolved
         with _PROCESS_LOCKS_GUARD:
-            self._thread_lock = _PROCESS_LOCKS.setdefault(resolved, threading.Lock())
-        safe = hashlib.sha256(resolved.encode("utf-8", "replace")).hexdigest()[:24]
+            self._thread_lock = _PROCESS_LOCKS.setdefault(key, threading.Lock())
+        safe = hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:24]
         self._path = get_hermes_home() / "workers" / "locks" / f"{safe}.lock"
+        self._wait_seconds = max(0.0, float(wait_seconds))
         self._fd: int | None = None
 
     def __enter__(self) -> "RepositoryLock":
-        if not self._thread_lock.acquire(timeout=30):
+        if not self._thread_lock.acquire(timeout=max(30.0, self._wait_seconds)):
             raise WorkspaceError("repository is busy")
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(2):
+        deadline = time.monotonic() + self._wait_seconds
+        swept_stale = False
+        while True:
             try:
                 self._fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.write(self._fd, str(os.getpid()).encode())
-                break
+                return self
             except FileExistsError as exc:
                 stale = False
                 try:
@@ -195,12 +217,17 @@ class RepositoryLock:
                     stale = not psutil.pid_exists(pid)
                 except (OSError, ValueError):
                     stale = True
-                if stale and attempt == 0:
+                if stale and not swept_stale:
+                    swept_stale = True
                     self._path.unlink(missing_ok=True)
+                    continue
+                if time.monotonic() < deadline:
+                    time.sleep(0.2)
+                    # The holder may die while we wait; allow another sweep.
+                    swept_stale = False
                     continue
                 self._thread_lock.release()
                 raise WorkspaceError(f"repository lock exists: {self._path}") from exc
-        return self
 
     def __exit__(self, *_exc: Any) -> None:
         if self._fd is not None:

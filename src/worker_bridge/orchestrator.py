@@ -341,8 +341,26 @@ class WorkerBridge:
                     plan = self.workspaces.plan(task_id, spec.to_dict())
                     if plan.get("allocation_state") == "allocating":
                         self.store.update_task(task_id, runtime={**plan, "pid": pid})
+                    if plan.get("isolation") == "git_worktree":
+                        # `git worktree add` mutates the repository's shared
+                        # metadata (worktree registry, refs, config locks), so
+                        # two concurrent adds against one repo can fail
+                        # transiently. Serialize only this short setup step —
+                        # never the worker's full task lifetime — under an
+                        # operation-scoped lock so it doesn't contend with a
+                        # direct-mode worker holding the plain repo lock.
+                        def _allocate() -> dict[str, Any]:
+                            with RepositoryLock(
+                                spec.workspace.repository,
+                                operation="worktree-setup",
+                                wait_seconds=prep_timeout,
+                            ):
+                                return self.workspaces.allocate(plan)
+                    else:
+                        def _allocate() -> dict[str, Any]:
+                            return self.workspaces.allocate(plan)
                     runtime = await asyncio.wait_for(
-                        asyncio.to_thread(self.workspaces.allocate, plan),
+                        asyncio.to_thread(_allocate),
                         timeout=prep_timeout,
                     )
                 except Exception as exc:  # noqa: BLE001 — includes asyncio.TimeoutError
