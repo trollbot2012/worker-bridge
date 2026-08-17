@@ -42,5 +42,12 @@ packages = ["src/worker_bridge"]
 line-length = 110
 target-version = "py310"
 
+[tool.ruff.lint]
+# The historical default selection, pinned explicitly: ruff 0.16 expanded
+# its defaults substantially and began failing on already-shipped code
+# (RUF022, RUF100, BLE001, ...). Keep lint behavior version-independent;
+# re-expanding the rule set should be a deliberate future decision.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
