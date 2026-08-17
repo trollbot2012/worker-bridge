@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import os
@@ -11,8 +12,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-
-import psutil
 
 from worker_bridge.environ import get_home as get_hermes_home
 
@@ -169,6 +168,54 @@ def _reftx_hook_present(repository: Path) -> bool:
     return (common / "hooks" / "reference-transaction").exists()
 
 
+def _claim_lock_file(fd: int) -> None:
+    """Atomically claim the lock file's first byte, or raise OSError.
+
+    Windows: ``msvcrt.locking`` — the C runtime's ``_locking`` operation,
+    held per descriptor and released by the operating system when the
+    owning process exits. POSIX: ``fcntl.flock`` — held per open file
+    description with the same death-release guarantee. Both turn "is the
+    holder still alive?" into a kernel question.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _is_lock_contention(exc: OSError) -> bool:
+    """True when a claim failure means another holder owns the lock.
+
+    POSIX ``flock`` reports contention as EWOULDBLOCK/EAGAIN (raised as
+    BlockingIOError) or EACCES. The Windows C runtime's ``_locking``
+    reports contention as EACCES/EDEADLK; EBADF, EINVAL, and other errors
+    are genuine failures whose cause must survive. Anything not classified
+    as contention propagates unchanged.
+    """
+    if isinstance(exc, BlockingIOError):
+        return True
+    if os.name == "nt":
+        return exc.errno in {errno.EACCES, getattr(errno, "EDEADLK", -1)}
+    return exc.errno == errno.EACCES
+
+
+def _release_lock_file(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 class RepositoryLock:
     """Process and cross-process lock used by direct-workspace mode.
 
@@ -178,9 +225,25 @@ class RepositoryLock:
     not serialize on one global per-repo lock. Same operation on the same
     repository still excludes.
 
-    ``wait_seconds`` bounds how long acquisition waits for a live holder to
-    release before raising. The default (0) keeps the historical fail-fast
-    behavior direct mode relies on.
+    Cross-process exclusion is a kernel-mediated byte lock on a small
+    per-key lock file (``msvcrt.locking`` on Windows, ``fcntl.flock`` on
+    POSIX). The kernel releases it when the owning process dies, so a
+    crashed holder needs no stale-file sweep — reading a pid from the file
+    and unlinking it (the previous scheme) could not distinguish a dead
+    holder's file from one a peer had just legitimately recreated, and the
+    resulting unlink could delete a live lock. Lock files are therefore
+    never unlinked: they are permanent claim points, one per repository
+    (and operation), a few bytes each.
+
+    ``wait_seconds`` bounds how long acquisition waits for a *cross-process*
+    holder to release before raising; the default (0) fails fast. In-process
+    contention on the same key waits up to ``max(30, wait_seconds)`` seconds
+    on the thread lock first — parallel worktree setup relies on that floor.
+
+    Behavior note: the pid written to the lock file is diagnostic only. A
+    failure to record it is ignored instead of aborting acquisition — the
+    previous implementation raised from the pid write, so this is a
+    deliberate behavior change.
     """
 
     def __init__(
@@ -202,39 +265,58 @@ class RepositoryLock:
     def __enter__(self) -> "RepositoryLock":
         if not self._thread_lock.acquire(timeout=max(30.0, self._wait_seconds)):
             raise WorkspaceError("repository is busy")
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + self._wait_seconds
-        swept_stale = False
-        while True:
-            try:
-                self._fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self._fd, str(os.getpid()).encode())
-                return self
-            except FileExistsError as exc:
-                stale = False
+        owned = False
+        fd: int | None = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            deadline = time.monotonic() + self._wait_seconds
+            while True:
+                candidate = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
                 try:
-                    pid = int(self._path.read_text(encoding="ascii").strip())
-                    stale = not psutil.pid_exists(pid)
-                except (OSError, ValueError):
-                    stale = True
-                if stale and not swept_stale:
-                    swept_stale = True
-                    self._path.unlink(missing_ok=True)
-                    continue
-                if time.monotonic() < deadline:
+                    _claim_lock_file(candidate)
+                except OSError as exc:
+                    # Drop the claiming fd; a close failure here must not
+                    # replace the claim's error, which carries the real cause.
+                    try:
+                        os.close(candidate)
+                    except OSError:
+                        pass
+                    if not _is_lock_contention(exc):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise WorkspaceError(f"repository lock exists: {self._path}") from exc
                     time.sleep(0.2)
-                    # The holder may die while we wait; allow another sweep.
-                    swept_stale = False
                     continue
-                self._thread_lock.release()
-                raise WorkspaceError(f"repository lock exists: {self._path}") from exc
+                fd = candidate
+                break
+            self._fd = fd
+            owned = True
+            try:
+                # Diagnostics only: the owning pid for humans inspecting the
+                # locks directory. Never gates ownership.
+                os.ftruncate(fd, 0)
+                os.write(fd, str(os.getpid()).encode())
+            except OSError:
+                pass
+            return self
+        finally:
+            if not owned:
+                try:
+                    if fd is not None:
+                        os.close(fd)
+                finally:
+                    self._thread_lock.release()
 
     def __exit__(self, *_exc: Any) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-        self._path.unlink(missing_ok=True)
-        self._thread_lock.release()
+        try:
+            if self._fd is not None:
+                fd, self._fd = self._fd, None
+                try:
+                    _release_lock_file(fd)
+                finally:
+                    os.close(fd)
+        finally:
+            self._thread_lock.release()
 
 
 class WorkspaceManager:
