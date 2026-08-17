@@ -1,12 +1,15 @@
-"""RepositoryLock operation scoping, bounded wait, and worktree-setup serialization."""
+"""RepositoryLock operation scoping, stale recovery, and worktree-setup serialization.
+
+Fail-fast against a live holder and bounded waiting are covered by real
+cross-process holder tests in ``test_repository_lock_concurrency.py`` —
+simulating a holder by writing a pid into the lock file no longer
+represents holding now that exclusion is a kernel-mediated byte lock.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
-import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,7 @@ from worker_bridge.adapters.mock import MockWorkerAdapter
 from worker_bridge.orchestrator import WorkerBridge
 from worker_bridge.registry import WorkerRegistry
 from worker_bridge.store import WorkerStore
-from worker_bridge.workspace import RepositoryLock, WorkspaceError, WorkspaceManager
+from worker_bridge.workspace import RepositoryLock, WorkspaceManager
 
 
 @pytest.fixture
@@ -43,52 +46,18 @@ def test_operation_scoped_lock_does_not_exclude_plain_lock(repository: Path):
             pass
 
 
-def test_same_operation_excludes_and_fail_fast_raises(repository: Path):
-    lock = RepositoryLock(repository, operation="worktree-setup")
-    with lock:
-        # Simulate a foreign live holder: the file exists and names a live
-        # pid, and we bypass the in-process thread lock by making a second
-        # lock object target the same file via a fresh key... the thread lock
-        # is shared per key, so use the lock FILE directly.
-        pass
-    # Foreign live holder: create the lock file with our own (live) pid.
-    holder = RepositoryLock(repository, operation="worktree-setup")
-    holder._path.parent.mkdir(parents=True, exist_ok=True)
-    holder._path.write_text(str(os.getpid()), encoding="ascii")
-    try:
-        with pytest.raises(WorkspaceError, match="repository lock exists"):
-            # thread lock is free (we never entered holder), so this exercises
-            # the file-lock fail-fast path against a live foreign pid.
-            with RepositoryLock(repository, operation="worktree-setup"):
-                pass
-    finally:
-        holder._path.unlink(missing_ok=True)
+# Fail-fast against a live foreign holder and bounded waiting under a
+# transient holder moved to test_repository_lock_concurrency.py, where real
+# subprocess holders exercise them (a lock file containing a live pid is no
+# longer equivalent to holding the lock).
 
 
-def test_wait_seconds_outlasts_a_transient_holder(repository: Path):
-    lock = RepositoryLock(repository, operation="worktree-setup", wait_seconds=10)
-    lock._path.parent.mkdir(parents=True, exist_ok=True)
-    lock._path.write_text(str(os.getpid()), encoding="ascii")  # live foreign holder
-
-    def release_soon() -> None:
-        time.sleep(0.5)
-        lock._path.unlink(missing_ok=True)
-
-    thread = threading.Thread(target=release_soon)
-    thread.start()
-    started = time.monotonic()
-    try:
-        with lock:
-            waited = time.monotonic() - started
-    finally:
-        thread.join()
-    assert waited >= 0.4  # actually waited for the holder, didn't raise
-
-
-def test_stale_lock_from_dead_pid_is_swept(repository: Path):
+def test_stale_lock_file_from_dead_pid_is_recoverable(repository: Path):
     lock = RepositoryLock(repository, operation="worktree-setup")
     lock._path.parent.mkdir(parents=True, exist_ok=True)
-    # A pid that cannot be alive (way beyond any real pid table on CI).
+    # A pid that cannot be alive (way beyond any real pid table on CI). With
+    # kernel-mediated exclusion the leftover record claims nothing: the file
+    # is only ever a claim point, so acquisition succeeds immediately.
     lock._path.write_text("999999999", encoding="ascii")
     with lock:
         pass  # acquired despite the leftover file
