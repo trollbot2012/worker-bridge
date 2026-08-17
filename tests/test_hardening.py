@@ -31,7 +31,7 @@ from worker_bridge.orchestrator import _terminate_runner_tree
 
 from worker_bridge.adapters.mock import MockWorkerAdapter
 from worker_bridge.orchestrator import WorkerBridge
-from worker_bridge.redaction import redact, redact_text
+from worker_bridge.redaction import redact_text
 from worker_bridge.registry import WorkerRegistry
 from worker_bridge.store import WorkerStore
 from worker_bridge.workspace import WorkspaceManager
@@ -80,7 +80,7 @@ def _bridge(store: WorkerStore, adapter: MockWorkerAdapter, root: Path, **kwargs
 
 def test_recover_running_leaves_live_pid_untouched(tmp_path: Path, repository: Path):
     store = WorkerStore(tmp_path / "s.db")
-    task = store.create_task(_spec(repository, task_id="live"))
+    store.create_task(_spec(repository, task_id="live"))
     # A task owned by THIS (alive) process must survive a peer's recovery sweep.
     store.update_task("live", status="running", runtime={"pid": os.getpid()})
     assert store.recover_running() == 0
@@ -99,7 +99,7 @@ def test_constructing_a_second_bridge_does_not_pause_live_task(tmp_path: Path, r
     store = WorkerStore(tmp_path / "s.db")
     adapter = MockWorkerAdapter()
     b1 = _bridge(store, adapter, tmp_path / "wt")
-    task = b1.create_task(_spec(repository, task_id="t"))
+    b1.create_task(_spec(repository, task_id="t"))
     store.update_task("t", status="running", runtime={"pid": os.getpid()})
     # Any other `hermes worker ...` command / runner spawn builds a bridge:
     _bridge(WorkerStore(store.path), MockWorkerAdapter(), tmp_path / "wt2")
